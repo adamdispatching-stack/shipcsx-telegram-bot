@@ -14,7 +14,5 @@ RUN python -m playwright install chromium
 
 COPY bot.py .
 
-# Run a HEADED Chromium under a virtual display (Xvfb). ShipCSX's Angular form
-# does not render reliably in headless mode, so we drive a real browser window
-# inside Xvfb. xvfb is already present in the Playwright image.
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1366x900x24", "python", "bot.py"]
+# Start the bot (headless Chromium). PYTHONUNBUFFERED above keeps logs live.
+CMD ["python", "bot.py"]

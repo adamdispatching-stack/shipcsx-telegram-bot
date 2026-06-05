@@ -45,10 +45,11 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Default to a HEADED browser (driven under Xvfb on the server). Headless mode
-# does not render the Angular form reliably. Set PLAYWRIGHT_HEADLESS=1 to force
-# headless (e.g. for quick local debugging).
-HEADLESS = os.environ.get("PLAYWRIGHT_HEADLESS", "0").lower() in ("1", "true", "yes")
+# Run headless by default. We override the user-agent (below) so ShipCSX does
+# not treat us as a bot, plus the navigation has retries + a menu fallback, which
+# together make the Angular form render fine without a real display.
+# Set PLAYWRIGHT_HEADLESS=0 to force a visible browser (local debugging only).
+HEADLESS = os.environ.get("PLAYWRIGHT_HEADLESS", "1").lower() in ("1", "true", "yes")
 
 # Terminal shortcut letters -> exact label shown in the ShipCSX dropdown.
 TERMINALS = {
