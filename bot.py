@@ -404,12 +404,17 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    log.info("Boot: building application (headless=%s)...", HEADLESS)
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     log.info("Bot starting. Authorized chats: %s", AUTHORIZED_CHAT_IDS or "ANYONE")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log.exception("FATAL: bot crashed on startup")
+        raise

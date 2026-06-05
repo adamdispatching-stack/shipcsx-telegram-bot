@@ -1,6 +1,9 @@
 # Playwright's official image already includes Chromium + all system libs.
 FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 
+# Unbuffered stdout/stderr so logs show up live in Railway.
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 COPY requirements.txt .
