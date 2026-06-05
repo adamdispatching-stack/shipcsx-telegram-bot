@@ -15,9 +15,16 @@ import logging
 from datetime import datetime, date
 
 from playwright.async_api import async_playwright
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s", level=logging.INFO
@@ -59,6 +66,11 @@ TERMINALS = {
 
 # Only one browser lookup at a time (keeps memory low on small hosts).
 _lookup_lock = asyncio.Lock()
+
+# Pending lookups awaiting a railyard-button tap: id -> list[shipment dicts].
+# In-memory only (cleared on restart), which is fine for this use.
+PENDING: dict[int, list] = {}
+_pending_counter = 0
 
 
 # ---------------------------------------------------------------------------
@@ -237,21 +249,34 @@ async def shipcsx_lookup(terminal_label: str, equip_initial: str, equip_number: 
             await option.click()
             await page.wait_for_timeout(300)
 
-            # --- Fill equipment + reference (first row) ---
+            # --- Fill equipment + (optional) reference (first row) ---
+            # Real keystrokes are required: Angular only registers the field as
+            # valid (and enables Search) on genuine key events.
             inputs = page.locator("input.p-inputtext")
             equip_field = inputs.nth(0)
             ref_field = inputs.nth(1)
 
             await equip_field.click()
             await equip_field.fill("")
-            await equip_field.type(equipment_text, delay=20)
+            await equip_field.type(equipment_text, delay=25)
 
-            await ref_field.click()
-            await ref_field.fill("")
-            await ref_field.type(reference, delay=20)
+            if reference:
+                await ref_field.click()
+                await ref_field.fill("")
+                await ref_field.type(reference, delay=25)
 
-            # --- Submit ---
-            await page.get_by_role("button", name="Search").click()
+            # --- Submit (wait for the button to become enabled first) ---
+            search_btn = page.get_by_role("button", name="Search")
+            try:
+                await search_btn.wait_for(state="visible", timeout=5000)
+                # Give Angular a moment to flip the button to enabled.
+                for _ in range(20):
+                    if await search_btn.is_enabled():
+                        break
+                    await page.wait_for_timeout(150)
+            except Exception:
+                pass
+            await search_btn.click()
 
             # Wait for the captured response.
             body = await asyncio.wait_for(result_future, timeout=timeout_ms / 1000)
@@ -281,12 +306,13 @@ def format_result(req: dict, body: dict) -> str:
         header += f"\nPickup #: {req['reference']}"
 
     if not shipments:
-        reason = ""
+        desc = ""
         if failed:
-            reason = "\nThe terminal had no match for this container + pickup number."
+            desc = (failed[0] or {}).get("failedSearchDescription") or ""
+        reason = f"\n{desc}." if desc else ""
         return (
-            f"{header}\n\n❌ No shipment found.{reason}\n"
-            "Double-check the container, pickup number, and terminal."
+            f"{header}\n\n❌ Not found at this terminal.{reason}\n"
+            "Check the container number and try the other railyard."
         )
 
     s = shipments[0]
@@ -343,71 +369,121 @@ def authorized(chat_id: int) -> bool:
 
 
 HELP_TEXT = (
-    "Send me a shipment and I'll check ShipCSX out-gate readiness.\n\n"
-    "Format:\n"
-    "Container# AZNU 243186\n"
-    "PU# 02508796\n"
-    "Terminal: C\n\n"
-    "Terminals:  C = Chambersburg   S = South Kearny\n"
-    "You can send several at once (one per line)."
+    "Send me a container and I'll check ShipCSX, then ask which railyard.\n\n"
+    "Format (pickup # is optional):\n"
+    "AZNU243186\n"
+    "02508796\n\n"
+    "• Line 1 = container number\n"
+    "• Line 2 = pickup number — leave it out if you're dropping / ingating\n\n"
+    "You can send several containers (one per line). I'll pop up buttons for the "
+    "railyard, so you don't have to type C or S."
 )
+
+
+def _yard_keyboard(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Chambersburg", callback_data=f"yard|C|{pid}"),
+            InlineKeyboardButton("South Kearny", callback_data=f"yard|S|{pid}"),
+        ]]
+    )
+
+
+def _summary(shipments: list) -> str:
+    lines = []
+    for s in shipments:
+        line = f"• {s['initial']} {s['number']}"
+        if s.get("reference"):
+            line += f"  (PU# {s['reference']})"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_chat.id):
         return
-    await update.message.reply_text(
-        f"Your chat ID is {update.effective_chat.id}.\n\n{HELP_TEXT}"
-    )
+    await update.message.reply_text(HELP_TEXT)
 
 
-async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not authorized(chat_id):
-        log.warning("Ignoring message from unauthorized chat %s", chat_id)
-        return
-
-    text = update.message.text or ""
-    shipments = parse_shipments(text)
-
-    if not shipments or not shipments[0]["reference"] or not shipments[0]["terminal"]:
-        await update.message.reply_text(
-            "I couldn't read that. I need a container, a pickup number, and a "
-            f"terminal (C or S).\n\n{HELP_TEXT}"
-        )
-        return
-
+async def run_and_reply(message, ctx: ContextTypes.DEFAULT_TYPE, shipments: list):
+    """Run each shipment lookup and reply with the result."""
+    chat_id = message.chat_id
     for req in shipments:
-        if not req["reference"] or not req["terminal"]:
-            await update.message.reply_text(
-                f"Skipped {req['initial']} {req['number']}: missing pickup number "
-                "or terminal."
-            )
-            continue
-
         await ctx.bot.send_chat_action(chat_id, ChatAction.TYPING)
         try:
             async with _lookup_lock:
                 body = await shipcsx_lookup(
-                    req["terminal"], req["initial"], req["number"], req["reference"]
+                    req["terminal"], req["initial"], req["number"],
+                    req.get("reference"),
                 )
-            await update.message.reply_text(format_result(req, body))
+            await message.reply_text(format_result(req, body))
         except asyncio.TimeoutError:
-            await update.message.reply_text(
+            await message.reply_text(
                 f"⏱️ Timed out looking up {req['initial']} {req['number']}. "
                 "ShipCSX may be slow — try again."
             )
         except Exception as e:  # noqa
             log.exception("Lookup failed")
-            await update.message.reply_text(
+            await message.reply_text(
                 f"⚠️ Error looking up {req['initial']} {req['number']}: {e}"
             )
+
+
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global _pending_counter
+    chat_id = update.effective_chat.id
+    if not authorized(chat_id):
+        log.warning("Ignoring message from unauthorized chat %s", chat_id)
+        return
+
+    shipments = parse_shipments(update.message.text or "")
+    if not shipments:
+        await update.message.reply_text(
+            "I couldn't find a container number in that.\n\n" + HELP_TEXT
+        )
+        return
+
+    # If the user already typed a terminal (C/S/name), just run it.
+    if shipments[0].get("terminal"):
+        await run_and_reply(update.message, ctx, shipments)
+        return
+
+    # Otherwise ask which railyard with inline buttons.
+    _pending_counter += 1
+    pid = _pending_counter
+    PENDING[pid] = shipments
+    await update.message.reply_text(
+        "Which railyard?\n" + _summary(shipments),
+        reply_markup=_yard_keyboard(pid),
+    )
+
+
+async def on_yard_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, code, pid_s = query.data.split("|")
+        pid = int(pid_s)
+    except Exception:
+        return
+    terminal = TERMINALS.get(code)
+    shipments = PENDING.pop(pid, None)
+    if not shipments or not terminal:
+        await query.edit_message_text(
+            "That request expired — please resend the container."
+        )
+        return
+    for s in shipments:
+        s["terminal"] = terminal
+    await query.edit_message_text(f"🔎 Checking {terminal}…\n{_summary(shipments)}")
+    await run_and_reply(query.message, ctx, shipments)
 
 
 def main():
     log.info("Boot: building application (headless=%s)...", HEADLESS)
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CallbackQueryHandler(on_yard_callback, pattern=r"^yard\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     log.info("Bot starting. Authorized chats: %s", AUTHORIZED_CHAT_IDS or "ANYONE")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

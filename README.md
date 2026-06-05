@@ -4,15 +4,18 @@ A Telegram bot that checks **ShipCSX "Find My Shipment"** out-gate readiness and
 replies to you in Telegram. It runs 24/7 on Railway, so it works even when your
 PC is off — you just message the bot.
 
-You send:
+You send (pickup number is **optional** — leave it out when dropping/ingating):
 
 ```
-Container# AZNU 243186
-PU# 02508796
-Terminal: C
+AZNU243186
+02508796
 ```
 
-It replies:
+The bot replies with **buttons** asking which railyard:
+
+> Which railyard?   [ Chambersburg ]  [ South Kearny ]
+
+Tap one, and it replies:
 
 ```
 📦 ShipCSX — Chambersburg
@@ -30,8 +33,9 @@ Authorized Through: 06/07/26
 (checked 06/05/26 02:39)
 ```
 
-Terminals: **C = Chambersburg**, **S = South Kearny**. You can send several
-shipments in one message (one per line).
+- **Line 1** = container number, **line 2** = pickup number (optional).
+- Send several containers (one per line) and the railyard you pick applies to all.
+- You can still type the railyard inline (`C` / `S`) to skip the buttons.
 
 ---
 
