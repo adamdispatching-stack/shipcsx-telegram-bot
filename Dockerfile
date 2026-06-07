@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Make sure the Chromium build Playwright expects is present.
 RUN python -m playwright install chromium
 
-COPY bot.py .
+COPY bot.py entrypoint.sh ./
+RUN chmod +x entrypoint.sh
 
-# Start the bot (headless Chromium). PYTHONUNBUFFERED above keeps logs live.
-CMD ["python", "bot.py"]
+# Start a virtual display (Xvfb) and run the bot HEADED inside it.
+CMD ["bash", "entrypoint.sh"]

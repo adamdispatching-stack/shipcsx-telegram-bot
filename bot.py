@@ -52,11 +52,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Run headless by default. We override the user-agent (below) so ShipCSX does
-# not treat us as a bot, plus the navigation has retries + a menu fallback, which
-# together make the Angular form render fine without a real display.
-# Set PLAYWRIGHT_HEADLESS=0 to force a visible browser (local debugging only).
-HEADLESS = os.environ.get("PLAYWRIGHT_HEADLESS", "1").lower() in ("1", "true", "yes")
+# Run HEADED by default (a virtual Xvfb display is provided by entrypoint.sh on
+# the server). ShipCSX's Angular form renders reliably in a headed browser but
+# is flaky in pure headless. Set PLAYWRIGHT_HEADLESS=1 to force headless.
+HEADLESS = os.environ.get("PLAYWRIGHT_HEADLESS", "0").lower() in ("1", "true", "yes")
 
 # Terminal shortcut letters -> exact label shown in the ShipCSX dropdown.
 TERMINALS = {
@@ -151,42 +150,33 @@ def parse_shipments(text: str):
 # Browser lookup against the public ShipCSX form
 # ---------------------------------------------------------------------------
 async def _open_lookup_form(page):
-    """Navigate to the lookup form and make sure the Angular form has rendered.
+    """Navigate to the lookup form and wait until the Angular form has rendered.
 
-    Retries with a reload, and falls back to opening it through the
-    Intermodal > Equipment Lookup menu if the direct route comes up blank.
+    Retries the whole load (goto + reload) several times, since a cold browser
+    on a small host can take a while to paint the SPA.
     """
     last_err = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
-            await page.goto(LOOKUP_URL, wait_until="domcontentloaded")
-            # Let the Angular bundle + first XHRs settle (ignore if it never
-            # fully idles because of analytics beacons).
+            if attempt == 0:
+                await page.goto(LOOKUP_URL, wait_until="domcontentloaded")
+            else:
+                await page.goto(LOOKUP_URL, wait_until="domcontentloaded")
+                try:
+                    await page.reload(wait_until="domcontentloaded")
+                except Exception:
+                    pass
+            # Let the Angular bundle settle (ignore if analytics beacons keep it
+            # from ever fully idling).
             try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
-            try:
-                await page.wait_for_selector("p-dropdown", state="visible", timeout=12000)
-                return
-            except Exception as e:
-                last_err = e
-
-            # Fallback: force the Intermodal > Equipment Lookup view.
-            try:
-                await page.get_by_text("INTERMODAL", exact=True).first.click(timeout=3000)
-                await page.wait_for_timeout(600)
-                link = page.get_by_role("link", name="EQUIPMENT LOOKUP")
-                if await link.count():
-                    await link.first.click()
-                await page.wait_for_selector("p-dropdown", state="visible", timeout=12000)
-                return
-            except Exception as e:
-                last_err = e
-
-            await page.reload(wait_until="domcontentloaded")
+            await page.wait_for_selector("p-dropdown", state="visible", timeout=20000)
+            return
         except Exception as e:
             last_err = e
+            log.warning("Form not ready (attempt %s): %s", attempt + 1, e)
             await page.wait_for_timeout(1500)
     raise last_err or RuntimeError("ShipCSX lookup form did not render")
 
