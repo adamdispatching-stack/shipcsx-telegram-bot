@@ -288,13 +288,105 @@ async def shipcsx_lookup(terminal_label: str, equip_initial: str, equip_number: 
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
-def _fmt_date(iso: str) -> str:
+def _fmt_date(iso) -> str:
     if not iso:
         return "-"
     try:
-        return datetime.fromisoformat(iso.replace("Z", "")).strftime("%m/%d/%y")
+        return datetime.fromisoformat(str(iso).replace("Z", "")).strftime("%m/%d/%y")
     except Exception:
-        return iso
+        return str(iso)
+
+
+def _fmt_dt_local(iso, tz_name) -> str:
+    """A UTC ISO timestamp in the terminal's local time, as MM/DD HH:MM."""
+    if not iso:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+                dt = dt.astimezone(ZoneInfo(tz_name))
+            except Exception:
+                pass
+        return dt.strftime("%m/%d %H:%M")
+    except Exception:
+        return str(iso)
+
+
+def _now() -> str:
+    return datetime.now().strftime("%m/%d/%y %H:%M")
+
+
+def _format_ingate(header: str, s: dict, status: str) -> str:
+    """Driver is DROPPING a load — show in-gate readiness + gate window."""
+    wb = s.get("waybill", {}) or {}
+    res = s.get("reservation", {}) or {}
+    term = s.get("terminal", {}) or {}
+    tz = term.get("timezoneID")
+
+    load_empty = wb.get("shipmentType") or "-"
+    waybill_date = _fmt_date(wb.get("waybillDate"))
+    rdy = res.get("ingateReadiness", {}) or {}
+    rdy_text = rdy.get("statusText") or "-"
+    mark = "✅ " if rdy.get("statusCode") == "RTIG" else ""
+    gate_to = _fmt_dt_local(res.get("ingateDateTo"), tz)
+    res_id = res.get("reservationId")
+
+    lines = [
+        header, "",
+        f"Status: {status}",
+        f"In-Gate: {mark}{rdy_text}",
+        f"Load/Empty: {load_empty}",
+        f"Waybill Date: {waybill_date}",
+        f"Gate Window: expires {gate_to}",
+    ]
+    if res_id:
+        lines.append(f"Reservation: {res_id}")
+    lines += ["", f"(checked {_now()})"]
+    return "\n".join(lines)
+
+
+def _format_outgate(header: str, s: dict, status: str) -> str:
+    """Driver is PICKING UP — show out-gate readiness + storage / free time."""
+    eq = s.get("equipment", {}) or {}
+    chassis = eq.get("chassis") or "-"
+    premise = s.get("premise", {}) or {}
+    parking = premise.get("parkingLocation") or "-"
+    notified = _fmt_date(premise.get("notifiedDate"))
+    last_free = _fmt_date(premise.get("lastFreeDate"))
+    auth_through = _fmt_date(premise.get("authorizedThroughDate"))
+
+    ready_line = ""
+    if status == "NOTIFIED":
+        ready_line = "Out-Gate: ✅ Ready to out-gate\n"
+
+    warn = ""
+    lf = premise.get("lastFreeDate")
+    if lf:
+        try:
+            days = (date.fromisoformat(lf) - date.today()).days
+            if days < 0:
+                warn = "\n⚠️ Past last free day — storage charges may be accruing."
+            elif days == 0:
+                warn = "\n⚠️ Today is the last free day."
+            elif days <= 1:
+                warn = f"\n⏳ {days} day of free time left."
+        except Exception:
+            pass
+
+    return (
+        f"{header}\n\n"
+        f"Status: {status}\n"
+        f"{ready_line}"
+        f"Parking: {parking}\n"
+        f"Chassis: {chassis}\n"
+        f"Notified: {notified}\n"
+        f"Last Free Day: {last_free}\n"
+        f"Authorized Through: {auth_through}"
+        f"{warn}\n\n"
+        f"(checked {_now()})"
+    )
 
 
 def format_result(req: dict, body: dict) -> str:
@@ -317,48 +409,11 @@ def format_result(req: dict, body: dict) -> str:
 
     s = shipments[0]
     status = s.get("shipmentStatus", "UNKNOWN")
-    eq = s.get("equipment", {}) or {}
-    chassis = eq.get("chassis") or "-"
-    premise = s.get("premise", {}) or {}
-    parking = premise.get("parkingLocation") or "-"
-    notified = _fmt_date(premise.get("notifiedDate"))
-    last_free = _fmt_date(premise.get("lastFreeDate"))
-    auth_through = _fmt_date(premise.get("authorizedThroughDate"))
 
-    # Derived readiness: NOTIFIED means the box has been made available.
-    ready_line = ""
-    if status == "NOTIFIED":
-        ready_line = "Out-Gate: ✅ Ready to out-gate\n"
-
-    # Free-time warning.
-    warn = ""
-    lf = premise.get("lastFreeDate")
-    if lf:
-        try:
-            d = date.fromisoformat(lf)
-            days = (d - date.today()).days
-            if days < 0:
-                warn = "\n⚠️ Past last free day — storage charges may be accruing."
-            elif days == 0:
-                warn = "\n⚠️ Today is the last free day."
-            elif days <= 1:
-                warn = f"\n⏳ {days} day of free time left."
-        except Exception:
-            pass
-
-    now = datetime.now().strftime("%m/%d/%y %H:%M")
-    return (
-        f"{header}\n\n"
-        f"Status: {status}\n"
-        f"{ready_line}"
-        f"Parking: {parking}\n"
-        f"Chassis: {chassis}\n"
-        f"Notified: {notified}\n"
-        f"Last Free Day: {last_free}\n"
-        f"Authorized Through: {auth_through}"
-        f"{warn}\n\n"
-        f"(checked {now})"
-    )
+    # In-gate (dropping a load) vs out-gate (picking up).
+    if status == "INGATE" or s.get("reservation"):
+        return _format_ingate(header, s, status)
+    return _format_outgate(header, s, status)
 
 
 # ---------------------------------------------------------------------------
